@@ -1,0 +1,16 @@
+# Binaries
+kdiff
+
+# IDE & OS files
+.idea/
+.DS_Store
+
+# AI Code Assistants & Agents
+.junie/
+.codex/
+.claude/
+.cursor/
+.aider*
+.windsurf/
+.continue/
+.copilot/

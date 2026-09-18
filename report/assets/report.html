@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>kdiff - {{.Title}}</title>
+  <style>{{.StyleCSS}}</style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-title-group">
+      <h1>
+        kdiff report
+        <span class="badge-title">{{.Title}}</span>
+      </h1>
+    </div>
+
+    <div class="header-meta">
+      <div>
+        <span style="color: var(--text-muted)">Left:</span> <code style="font-family: var(--font-mono);" title="{{.LeftPath}}">{{.LeftPath}}</code> &rarr;
+        <span style="color: var(--text-muted)">Right:</span> <code style="font-family: var(--font-mono);" title="{{.RightPath}}">{{.RightPath}}</code>
+      </div>
+
+      <div class="metrics-bar">
+        <span class="metric-tag added">{{.AddedCount}} added</span>
+        <span class="metric-tag modified">{{.ModifiedCount}} modified</span>
+        <span class="metric-tag deleted">{{.DeletedCount}} deleted</span>
+        <span class="metric-tag identical">{{.IdenticalCount}} identical</span>
+      </div>
+
+      <div>
+        <a href="../index.html" style="color: var(--accent-color); text-decoration: none; font-size: 0.8rem;">&larr; Catalog</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="app-body">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-search-box">
+        <input type="text" id="search-input" class="search-input" placeholder="Filter files (path)..." autocomplete="off" />
+        <div class="filter-pills">
+          <button class="pill-btn active" data-filter="all">All ({{.TotalFiles}})</button>
+          <button class="pill-btn" data-filter="changed">Changed</button>
+          <button class="pill-btn" data-filter="modified">Modified ({{.ModifiedCount}})</button>
+          <button class="pill-btn" data-filter="added">Added ({{.AddedCount}})</button>
+          <button class="pill-btn" data-filter="deleted">Deleted ({{.DeletedCount}})</button>
+          <button class="pill-btn" data-filter="identical">Identical ({{.IdenticalCount}})</button>
+        </div>
+      </div>
+
+      <ul id="file-list" class="file-list"></ul>
+    </aside>
+
+    <!-- Main Diff View -->
+    <main class="main-view">
+      <div class="diff-toolbar">
+        <div class="file-header-left">
+          <div class="file-nav-group">
+            <button id="btn-prev-file" class="nav-btn" title="Previous file (&uarr; or &larr; or k)" aria-label="Previous file">&larr;</button>
+            <span id="file-counter" class="file-counter" title="Current file position">- / -</span>
+            <button id="btn-next-file" class="nav-btn" title="Next file (&darr; or &rarr; or j)" aria-label="Next file">&rarr;</button>
+          </div>
+          <div id="active-file-title" class="active-file-title">Select a file to inspect diff</div>
+        </div>
+        <div class="view-mode-switch">
+          <button id="btn-split" class="switch-btn active">Split View</button>
+          <button id="btn-unified" class="switch-btn">Unified View</button>
+        </div>
+      </div>
+
+      <div id="diff-container" class="diff-container">
+        <div class="empty-state">
+          <p>Loading diff...</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script id="report-data" type="application/json">{{.ReportJSON}}</script>
+  <script>{{.AppJS}}</script>
+</body>
+</html>
