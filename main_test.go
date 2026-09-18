@@ -2,11 +2,17 @@ package main_test
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	main "github.com/ivanlunardi/kdiff"
 )
@@ -62,13 +68,15 @@ func TestCLIIntegration(t *testing.T) {
 	})
 
 	t.Run("Help Command with Subcommands", func(t *testing.T) {
-		var stdout, stderr bytes.Buffer
-		err := main.Run([]string{"help", "compare"}, &stdout, &stderr, nil)
-		if err != nil {
-			t.Fatalf("unexpected error running kdiff help compare: %v", err)
-		}
-		if !strings.Contains(stderr.String(), "Usage: kdiff compare") {
-			t.Errorf("expected compare help, got: %s", stderr.String())
+		for _, sub := range []string{"compare", "history", "serve", "clear", "version"} {
+			var stdout, stderr bytes.Buffer
+			err := main.Run([]string{"help", sub}, &stdout, &stderr, nil)
+			if err != nil {
+				t.Fatalf("unexpected error running kdiff help %s: %v", sub, err)
+			}
+			if !strings.Contains(stderr.String(), fmt.Sprintf("Usage: kdiff %s", sub)) {
+				t.Errorf("expected %s help, got: %s", sub, stderr.String())
+			}
 		}
 	})
 
@@ -332,6 +340,155 @@ func TestCLIIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("Serve Subcommand - Help Flags", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"serve", "--help"}, &stdout, &stderr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error running kdiff serve --help: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "Usage: kdiff serve") {
+			t.Errorf("expected serve help message in stderr, got: %s", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "-p, --port") || !strings.Contains(stderr.String(), "-H, --host") {
+			t.Errorf("expected flags in serve help message, got: %s", stderr.String())
+		}
+	})
+
+	t.Run("Serve Subcommand - Serves Catalog and Reports", func(t *testing.T) {
+		// Re-create a comparison report first
+		var compareStdout, compareStderr bytes.Buffer
+		err := main.Run([]string{"compare", "-o", reportsDir, "-t", "Serve Test Run", leftDir, rightDir}, &compareStdout, &compareStderr, nil)
+		if err != nil {
+			t.Fatalf("failed to create report: %v", err)
+		}
+
+		freePort := getFreePort(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var stdout, stderr bytes.Buffer
+		errCh := make(chan error, 1)
+
+		go func() {
+			errCh <- main.RunContext(ctx, []string{"serve", "-p", fmt.Sprintf("%d", freePort), "-H", "127.0.0.1", "-o", reportsDir}, &stdout, &stderr, nil)
+		}()
+
+		baseURL := fmt.Sprintf("http://127.0.0.1:%d", freePort)
+		client := &http.Client{Timeout: 1 * time.Second}
+
+		// Wait for server to start
+		var resp *http.Response
+		var lastErr error
+		for range 50 {
+			time.Sleep(20 * time.Millisecond)
+			resp, lastErr = client.Get(baseURL + "/")
+			if lastErr == nil && resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+
+		if lastErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
+			cancel()
+			<-errCh
+			t.Fatalf("server failed to respond on %s: %v", baseURL, lastErr)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("failed to read index response: %v", err)
+		}
+		bodyStr := string(body)
+		if !strings.Contains(bodyStr, "Reports Catalog") || !strings.Contains(bodyStr, "Serve Test Run") {
+			t.Errorf("expected catalog content with 'Reports Catalog' and 'Serve Test Run', got: %s", bodyStr)
+		}
+
+		// Verify history.json is served
+		histResp, err := client.Get(baseURL + "/history.json")
+		if err != nil {
+			t.Fatalf("failed to get history.json: %v", err)
+		}
+		defer histResp.Body.Close()
+		if histResp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 for history.json, got: %d", histResp.StatusCode)
+		}
+
+		// Cancel context and verify graceful shutdown
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("unexpected server error on shutdown: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for server to shut down")
+		}
+
+		outStr := stdout.String()
+		if !strings.Contains(outStr, "Starting kdiff report server...") {
+			t.Errorf("expected starting message in stdout, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, fmt.Sprintf("Available at: %s", baseURL)) {
+			t.Errorf("expected available URL in stdout, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "Server stopped.") {
+			t.Errorf("expected 'Server stopped.' in stdout, got: %s", outStr)
+		}
+	})
+
+	t.Run("Serve Subcommand - Empty reports directory creates catalog and serves", func(t *testing.T) {
+		emptyServeDir := filepath.Join(tempDir, "fresh_empty_serve_dir")
+		freePort := getFreePort(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var stdout, stderr bytes.Buffer
+		errCh := make(chan error, 1)
+
+		go func() {
+			errCh <- main.RunContext(ctx, []string{"serve", "--port", fmt.Sprintf("%d", freePort), "--output", emptyServeDir}, &stdout, &stderr, nil)
+		}()
+
+		baseURL := fmt.Sprintf("http://127.0.0.1:%d", freePort)
+		client := &http.Client{Timeout: 1 * time.Second}
+
+		var resp *http.Response
+		var lastErr error
+		for range 50 {
+			time.Sleep(20 * time.Millisecond)
+			resp, lastErr = client.Get(baseURL + "/")
+			if lastErr == nil && resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+
+		if lastErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
+			cancel()
+			<-errCh
+			t.Fatalf("server failed to respond on empty dir %s: %v", baseURL, lastErr)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("failed to read response: %v", err)
+		}
+		if !strings.Contains(string(body), "Reports Catalog") || !strings.Contains(string(body), "No comparison runs found.") {
+			t.Errorf("expected empty catalog content, got: %s", string(body))
+		}
+
+		cancel()
+		<-errCh
+	})
+
+	t.Run("Serve Subcommand - Invalid flag returns error", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"serve", "--invalid-flag"}, &stdout, &stderr, nil)
+		if err == nil {
+			t.Fatal("expected error for invalid flag, got nil")
+		}
+	})
+
 	t.Run("Version Command Displays Version", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		err := main.Run([]string{"version"}, &stdout, &stderr, nil)
@@ -407,6 +564,16 @@ func mustWriteFile(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write file %s: %v", path, err)
 	}
+}
+
+func getFreePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on free port: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 func TestVersionLdflags(t *testing.T) {

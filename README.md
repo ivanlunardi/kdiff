@@ -48,6 +48,10 @@ kdiff <command> [arguments]
   - `-t, --title <title>`: Custom title for this comparison run.
 - `kdiff history [flags]`: List past comparison runs and catalog link.
   - `-o, --output <dir>`: Custom output directory (default `~/.kdiff`).
+- `kdiff serve [flags]`: Start an HTTP server to view past comparison reports and catalog.
+  - `-p, --port <port>`: Port to listen on (default `8080`).
+  - `-H, --host <host>`: Host address to bind to (default `127.0.0.1`).
+  - `-o, --output <dir>`: Custom output directory (default `~/.kdiff`).
 - `kdiff clear [flags]`: Delete all past comparison reports and reset the catalog.
   - `-y, --yes`: Bypass interactive confirmation prompt.
   - `-o, --output <dir>`: Custom output directory (default `~/.kdiff`).
@@ -65,6 +69,10 @@ kdiff compare --full -t "Release 2.0 vs 2.1" -o ./diff-reports ./dirA ./dirB
 
 # View history
 kdiff history
+
+# Serve history and reports locally via HTTP
+kdiff serve
+kdiff serve -p 3000 -o ./diff-reports
 
 # Check version
 kdiff version

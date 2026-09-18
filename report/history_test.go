@@ -110,3 +110,43 @@ func TestClearHistory(t *testing.T) {
 		}
 	})
 }
+
+func TestEnsureCatalog(t *testing.T) {
+	t.Run("Generates index.html when missing", func(t *testing.T) {
+		tempDir := t.TempDir()
+		indexPath := filepath.Join(tempDir, "index.html")
+
+		if err := report.EnsureCatalog(tempDir); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		data, err := os.ReadFile(indexPath)
+		if err != nil {
+			t.Fatalf("failed to read created index.html: %v", err)
+		}
+		if len(data) == 0 {
+			t.Errorf("expected non-empty index.html")
+		}
+	})
+
+	t.Run("Does not overwrite existing index.html", func(t *testing.T) {
+		tempDir := t.TempDir()
+		indexPath := filepath.Join(tempDir, "index.html")
+		customContent := []byte("custom content")
+		if err := os.WriteFile(indexPath, customContent, 0644); err != nil {
+			t.Fatalf("failed to write custom index.html: %v", err)
+		}
+
+		if err := report.EnsureCatalog(tempDir); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		data, err := os.ReadFile(indexPath)
+		if err != nil {
+			t.Fatalf("failed to read index.html: %v", err)
+		}
+		if string(data) != "custom content" {
+			t.Errorf("expected index.html to retain original content, got %s", string(data))
+		}
+	})
+}

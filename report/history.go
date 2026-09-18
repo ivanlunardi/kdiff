@@ -99,7 +99,11 @@ func UpdateHistoryCatalog(outputDir string, meta RunMetadata) error {
 		return fmt.Errorf("writing %s: %w", historyFilePath, err)
 	}
 
-	// Render outputDir/index.html
+	return RenderCatalog(outputDir, runs)
+}
+
+// RenderCatalog generates or refreshes the index.html catalog file in outputDir based on given runs.
+func RenderCatalog(outputDir string, runs []RunMetadata) error {
 	tmplContent, err := assetsFS.ReadFile("assets/history.html")
 	if err != nil {
 		return fmt.Errorf("reading history template: %w", err)
@@ -130,6 +134,19 @@ func UpdateHistoryCatalog(outputDir string, meta RunMetadata) error {
 	}
 
 	return nil
+}
+
+// EnsureCatalog verifies that index.html exists in outputDir, generating it if missing.
+func EnsureCatalog(outputDir string) error {
+	indexPath := filepath.Join(outputDir, "index.html")
+	if _, err := os.Stat(indexPath); err == nil {
+		return nil
+	}
+	runs, err := LoadHistory(outputDir)
+	if err != nil {
+		return err
+	}
+	return RenderCatalog(outputDir, runs)
 }
 
 // ClearHistory deletes all run_* directories, history.json, and index.html in outputDir.

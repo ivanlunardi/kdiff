@@ -2,14 +2,20 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ivanlunardi/kdiff/differ"
@@ -85,6 +91,7 @@ Usage:
 Available Commands:
   compare     Compare two directories and generate an HTML diff report
   history     List past comparison runs
+  serve       Start an HTTP server to view comparison reports
   clear       Delete all past comparison reports and reset history
   version     Show kdiff version information
   help        Show help for kdiff or a specific command
@@ -99,6 +106,13 @@ Use "kdiff help <command>" or "kdiff <command> --help" for more information abou
 
 // Run executes the kdiff CLI pipeline with given arguments and streams.
 func Run(args []string, stdout, stderr io.Writer, stdin io.Reader) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return RunContext(ctx, args, stdout, stderr, stdin)
+}
+
+// RunContext executes the kdiff CLI pipeline with context, arguments, and streams.
+func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	if len(args) == 0 {
 		printUsage(stdout)
 		return nil
@@ -118,6 +132,8 @@ func Run(args []string, stdout, stderr io.Writer, stdin io.Reader) error {
 			return runCompare([]string{"--help"}, stdout, stderr)
 		case "history":
 			return runHistory([]string{"--help"}, stdout, stderr)
+		case "serve":
+			return runServe(ctx, []string{"--help"}, stdout, stderr)
 		case "clear":
 			return runClear([]string{"--help"}, stdout, stderr, stdin)
 		case "version":
@@ -131,6 +147,8 @@ func Run(args []string, stdout, stderr io.Writer, stdin io.Reader) error {
 		return runCompare(cmdArgs, stdout, stderr)
 	case "history":
 		return runHistory(cmdArgs, stdout, stderr)
+	case "serve":
+		return runServe(ctx, cmdArgs, stdout, stderr)
 	case "clear":
 		return runClear(cmdArgs, stdout, stderr, stdin)
 	case "version", "-v", "--version", "-V":
@@ -447,4 +465,116 @@ func runClear(args []string, stdout, stderr io.Writer, stdin io.Reader) error {
 
 	fmt.Fprintf(stdout, "Successfully deleted %d comparison report(s) and reset history in %s\n", cleanedCount, outDirAbs)
 	return nil
+}
+
+func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("kdiff serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var port int
+	fs.IntVar(&port, "port", 8080, "Port to listen on (default 8080)")
+	fs.IntVar(&port, "p", 8080, "Alias for --port")
+
+	var host string
+	fs.StringVar(&host, "host", "127.0.0.1", "Host address to bind to (default \"127.0.0.1\")")
+	fs.StringVar(&host, "H", "127.0.0.1", "Alias for --host")
+
+	var outputDir string
+	fs.StringVar(&outputDir, "output", "", "Output directory for reports (default \"~/.kdiff\")")
+	fs.StringVar(&outputDir, "o", "", "Alias for --output")
+
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "Usage: kdiff serve [flags]\n\n")
+		fmt.Fprintf(stderr, "Start an HTTP server to view past comparison reports and catalog.\n\n")
+		fmt.Fprintf(stderr, "Flags:\n")
+		fmt.Fprintf(stderr, "  -p, --port int        Port to listen on (default 8080)\n")
+		fmt.Fprintf(stderr, "  -H, --host string     Host address to bind to (default \"127.0.0.1\")\n")
+		fmt.Fprintf(stderr, "  -o, --output string   Output directory for reports (default \"~/.kdiff\")\n")
+		fmt.Fprintf(stderr, "  -h, --help            Show this help message\n")
+	}
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if outputDir == "" {
+		outputDir = getDefaultOutputDir()
+	} else {
+		outputDir = expandHomePath(outputDir)
+	}
+
+	outDirAbs, err := filepath.Abs(outputDir)
+	if err != nil {
+		return fmt.Errorf("resolving output directory: %w", err)
+	}
+
+	if err := os.MkdirAll(outDirAbs, 0755); err != nil {
+		return fmt.Errorf("creating reports directory %s: %w", outDirAbs, err)
+	}
+
+	if err := report.EnsureCatalog(outDirAbs); err != nil {
+		return fmt.Errorf("initializing catalog in %s: %w", outDirAbs, err)
+	}
+
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("starting listener on %s: %w", addr, err)
+	}
+	defer listener.Close()
+
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.Dir(outDirAbs)))
+
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	actualPort := port
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		actualPort = tcpAddr.Port
+	}
+
+	serverURL := fmt.Sprintf("http://%s:%d", host, actualPort)
+	if host == "0.0.0.0" || host == "" {
+		serverURL = fmt.Sprintf("http://localhost:%d", actualPort)
+	}
+
+	fmt.Fprintf(stdout, "Starting kdiff report server...\n")
+	fmt.Fprintf(stdout, "Serving reports from: %s\n", outDirAbs)
+	fmt.Fprintf(stdout, "Available at: %s\n", serverURL)
+	fmt.Fprintf(stdout, "Press Ctrl+C to stop.\n")
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		} else {
+			errCh <- nil
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("server failed: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		fmt.Fprintln(stdout, "\nShutting down server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("server shutdown: %w", err)
+		}
+		fmt.Fprintln(stdout, "Server stopped.")
+		return nil
+	}
 }
