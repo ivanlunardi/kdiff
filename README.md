@@ -18,6 +18,7 @@
 
 ```bash
 brew tap ivanlunardi/tap
+brew trust --formula ivanlunardi/tap/kdiff
 brew install kdiff
 ```
 
