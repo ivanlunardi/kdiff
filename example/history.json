@@ -1,0 +1,16 @@
+[
+  {
+    "id": "run_2026-09-18_16-39-32_kdiff_vs_kdiff_orig",
+    "directoryName": "run_2026-09-18_16-39-32_kdiff_vs_kdiff_orig",
+    "timestamp": "2026-09-18T16:39:32.128932+02:00",
+    "formattedDate": "2026-09-18 16:39:32",
+    "title": "kdiff vs kdiff_orig",
+    "leftPath": "/Users/ivanlunardi/Workspaces/workspace_korylus/kdiff/usecases/kdiff",
+    "rightPath": "/Users/ivanlunardi/Workspaces/workspace_korylus/kdiff/usecases/kdiff_orig",
+    "totalFiles": 24,
+    "addedCount": 1,
+    "deletedCount": 0,
+    "modifiedCount": 6,
+    "relativeURL": "run_2026-09-18_16-39-32_kdiff_vs_kdiff_orig/index.html"
+  }
+]

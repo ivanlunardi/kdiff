@@ -74,10 +74,32 @@ kdiff history
 kdiff serve
 kdiff serve -p 3000 -o ./diff-reports
 
+# Serve the bundled example reports
+kdiff serve -o ./example
+
 # Check version
 kdiff version
 kdiff --version
 ```
+
+---
+
+## Example Report
+
+![kdiff Example Report](assets/example.png)
+
+An example of generated HTML reports is available in the [`example/`](example/) directory:
+
+- **Catalog Overview:** [`example/index.html`](example/index.html)
+- **Interactive Diff Report:** [`example/run_2026-09-18_16-34-16_kdiff_orig_vs_kdiff/index.html`](example/run_2026-09-18_16-34-16_kdiff_orig_vs_kdiff/index.html)
+
+You can view and navigate the example locally by running:
+
+```bash
+kdiff serve -o ./example
+```
+
+Or by opening `example/index.html` directly in any web browser.
 
 ---
 
