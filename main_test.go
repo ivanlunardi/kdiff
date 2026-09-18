@@ -46,7 +46,7 @@ func TestCLIIntegration(t *testing.T) {
 		}
 
 		outStr := stdout.String()
-		if !strings.Contains(outStr, "Available Commands:") || !strings.Contains(outStr, "compare") || !strings.Contains(outStr, "history") || !strings.Contains(outStr, "clear") || !strings.Contains(outStr, "version") {
+		if !strings.Contains(outStr, "Available Commands:") || !strings.Contains(outStr, "compare") || !strings.Contains(outStr, "gitdiff") || !strings.Contains(outStr, "history") || !strings.Contains(outStr, "clear") || !strings.Contains(outStr, "version") {
 			t.Errorf("expected general usage with commands including version, got: %s", outStr)
 		}
 		if !strings.Contains(outStr, "-v, --version") {
@@ -68,7 +68,7 @@ func TestCLIIntegration(t *testing.T) {
 	})
 
 	t.Run("Help Command with Subcommands", func(t *testing.T) {
-		for _, sub := range []string{"compare", "history", "serve", "clear", "version"} {
+		for _, sub := range []string{"compare", "gitdiff", "history", "serve", "clear", "version"} {
 			var stdout, stderr bytes.Buffer
 			err := main.Run([]string{"help", sub}, &stdout, &stderr, nil)
 			if err != nil {
@@ -538,6 +538,185 @@ func TestCLIIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("GitDiff Subcommand - Help and Flags", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"gitdiff", "--help"}, &stdout, &stderr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error running kdiff gitdiff --help: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "Usage: kdiff gitdiff") {
+			t.Errorf("expected gitdiff help message in stderr, got: %s", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "--hash") || !strings.Contains(stderr.String(), "--tag") {
+			t.Errorf("expected --hash and --tag flags in help, got: %s", stderr.String())
+		}
+	})
+
+	t.Run("GitDiff Subcommand - Git not installed returns error", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir()) // empty directory so git is not found
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"gitdiff"}, &stdout, &stderr, nil)
+		if err == nil {
+			t.Fatal("expected error when git is not in PATH, got nil")
+		}
+		if !strings.Contains(err.Error(), "git is not installed or not in PATH") {
+			t.Errorf("expected error about git not installed, got: %v", err)
+		}
+	})
+
+	t.Run("GitDiff Subcommand - Non-git folder returns error", func(t *testing.T) {
+		nonGitDir := t.TempDir()
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"gitdiff", nonGitDir}, &stdout, &stderr, nil)
+		if err == nil {
+			t.Fatal("expected error when running gitdiff on non-git directory, got nil")
+		}
+		if !strings.Contains(err.Error(), "not inside a git repository") {
+			t.Errorf("expected error mentioning not inside a git repository, got: %v", err)
+		}
+	})
+
+	t.Run("GitDiff Subcommand - Both --hash and --tag specified returns error", func(t *testing.T) {
+		gitDir := t.TempDir()
+		initTestGitRepo(t, gitDir)
+
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"gitdiff", "--hash", "abc", "--tag", "v1.0.0", gitDir}, &stdout, &stderr, nil)
+		if err == nil {
+			t.Fatal("expected error specifying both --hash and --tag, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot specify both --hash and --tag") {
+			t.Errorf("expected error about both flags, got: %v", err)
+		}
+	})
+
+	t.Run("GitDiff Subcommand - Unborn HEAD in empty repo returns error", func(t *testing.T) {
+		emptyGitDir := t.TempDir()
+		runGitCmd(t, emptyGitDir, "init")
+
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"gitdiff", emptyGitDir}, &stdout, &stderr, nil)
+		if err == nil {
+			t.Fatal("expected error on empty git repo with unborn HEAD, got nil")
+		}
+		if !strings.Contains(err.Error(), "no commits") && !strings.Contains(err.Error(), "HEAD is unborn") {
+			t.Errorf("expected error about no commits / unborn HEAD, got: %v", err)
+		}
+	})
+
+	t.Run("GitDiff Subcommand - Non-existent tag or hash returns error", func(t *testing.T) {
+		gitDir := t.TempDir()
+		initTestGitRepo(t, gitDir)
+
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"gitdiff", "--tag", "non-existent-tag", gitDir}, &stdout, &stderr, nil)
+		if err == nil {
+			t.Fatal("expected error for non-existent tag, got nil")
+		}
+		if !strings.Contains(err.Error(), "tag not found") {
+			t.Errorf("expected 'tag not found' error, got: %v", err)
+		}
+
+		stderr.Reset()
+		stdout.Reset()
+		err = main.Run([]string{"gitdiff", "--hash", "deadbeef00", gitDir}, &stdout, &stderr, nil)
+		if err == nil {
+			t.Fatal("expected error for non-existent hash, got nil")
+		}
+		if !strings.Contains(err.Error(), "commit hash not found") {
+			t.Errorf("expected 'commit hash not found' error, got: %v", err)
+		}
+	})
+
+	t.Run("GitDiff Subcommand - HEAD default, Tag, Hash, and Subdirectory comparisons", func(t *testing.T) {
+		gitRepo := t.TempDir()
+		firstHash, secondHash := initTestGitRepo(t, gitRepo)
+
+		// Create a subdirectory inside the repo with some files
+		subDir := filepath.Join(gitRepo, "pkg", "sub")
+		mustMkdir(t, subDir)
+		mustWriteFile(t, filepath.Join(subDir, "code.go"), "package sub\n\nfunc V1() {}\n")
+		runGitCmd(t, gitRepo, "add", ".")
+		runGitCmd(t, gitRepo, "commit", "-m", "add pkg/sub")
+		thirdHash := strings.TrimSpace(runGitCmd(t, gitRepo, "rev-parse", "HEAD"))
+		runGitCmd(t, gitRepo, "tag", "v3.0.0")
+
+		// Make uncommitted working tree modifications:
+		// 1. Modify file1.txt
+		mustWriteFile(t, filepath.Join(gitRepo, "file1.txt"), "hello v3 working tree\n")
+		// 2. Add untracked file4.txt
+		mustWriteFile(t, filepath.Join(gitRepo, "file4.txt"), "brand new untracked\n")
+		// 3. Delete file3.txt
+		_ = os.Remove(filepath.Join(gitRepo, "file3.txt"))
+		// 4. Modify sub/code.go
+		mustWriteFile(t, filepath.Join(subDir, "code.go"), "package sub\n\nfunc V2() {}\n")
+
+		gitReportsDir := filepath.Join(tempDir, "git_reports")
+
+		// Test 1: Compare against HEAD (default)
+		var stdout, stderr bytes.Buffer
+		err := main.Run([]string{"gitdiff", "-o", gitReportsDir, gitRepo}, &stdout, &stderr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error running gitdiff against HEAD: %v, stderr: %s", err, stderr.String())
+		}
+
+		outStr := stdout.String()
+		if !strings.Contains(outStr, "Comparing:") || !strings.Contains(outStr, "git:HEAD") {
+			t.Errorf("expected output to mention git:HEAD, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "Comparison Summary:") {
+			t.Errorf("expected summary in output, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "Modified:    2") { // file1.txt, pkg/sub/code.go
+			t.Errorf("expected 2 modified files against HEAD, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "Added:       1") { // file4.txt
+			t.Errorf("expected 1 added file against HEAD, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "Deleted:     1") { // file3.txt
+			t.Errorf("expected 1 deleted file against HEAD, got: %s", outStr)
+		}
+
+		// Test 2: Compare against tag v1.0.0
+		stdout.Reset()
+		stderr.Reset()
+		err = main.Run([]string{"gitdiff", "--tag", "v1.0.0", "-o", gitReportsDir, "-t", "Diff against v1", gitRepo}, &stdout, &stderr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error running gitdiff against tag: %v, stderr: %s", err, stderr.String())
+		}
+		outStr = stdout.String()
+		if !strings.Contains(outStr, "git:tag v1.0.0") {
+			t.Errorf("expected output to mention git:tag v1.0.0, got: %s", outStr)
+		}
+
+		// Test 3: Compare against commit hash (second commit)
+		stdout.Reset()
+		stderr.Reset()
+		err = main.Run([]string{"gitdiff", "--hash", secondHash, "-o", gitReportsDir, gitRepo}, &stdout, &stderr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error running gitdiff against hash %s: %v, stderr: %s", secondHash, err, stderr.String())
+		}
+		outStr = stdout.String()
+		if !strings.Contains(outStr, "git:commit") {
+			t.Errorf("expected output to mention git:commit, got: %s", outStr)
+		}
+
+		// Test 4: Run gitdiff on subdirectory
+		stdout.Reset()
+		stderr.Reset()
+		err = main.Run([]string{"gitdiff", "-o", gitReportsDir, subDir}, &stdout, &stderr, nil)
+		if err != nil {
+			t.Fatalf("unexpected error running gitdiff on subdir: %v, stderr: %s", err, stderr.String())
+		}
+		outStr = stdout.String()
+		if !strings.Contains(outStr, "Total Files: 1") || !strings.Contains(outStr, "Modified:    1") {
+			t.Errorf("expected 1 total file modified in subdir diff, got: %s", outStr)
+		}
+
+		_ = firstHash
+		_ = thirdHash
+	})
+
 	t.Run("Unknown Subcommand Returns Error", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		args := []string{"unknown-command"}
@@ -564,6 +743,44 @@ func mustWriteFile(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write file %s: %v", path, err)
 	}
+}
+
+func initTestGitRepo(t *testing.T, dir string) (firstCommitHash, secondCommitHash string) {
+	t.Helper()
+	runGitCmd(t, dir, "init")
+	runGitCmd(t, dir, "config", "user.name", "Kdiff Tester")
+	runGitCmd(t, dir, "config", "user.email", "tester@kdiff.test")
+	runGitCmd(t, dir, "config", "commit.gpgsign", "false")
+
+	// Commit 1
+	mustWriteFile(t, filepath.Join(dir, "file1.txt"), "hello v1\n")
+	mustWriteFile(t, filepath.Join(dir, "file2.txt"), "to be deleted\n")
+	runGitCmd(t, dir, "add", ".")
+	runGitCmd(t, dir, "commit", "-m", "initial commit")
+	firstCommitHash = strings.TrimSpace(runGitCmd(t, dir, "rev-parse", "HEAD"))
+	runGitCmd(t, dir, "tag", "v1.0.0")
+
+	// Commit 2
+	mustWriteFile(t, filepath.Join(dir, "file1.txt"), "hello v2\n")
+	runGitCmd(t, dir, "rm", "file2.txt")
+	mustWriteFile(t, filepath.Join(dir, "file3.txt"), "added in commit 2\n")
+	runGitCmd(t, dir, "add", ".")
+	runGitCmd(t, dir, "commit", "-m", "second commit")
+	secondCommitHash = strings.TrimSpace(runGitCmd(t, dir, "rev-parse", "HEAD"))
+	runGitCmd(t, dir, "tag", "v2.0.0")
+
+	return firstCommitHash, secondCommitHash
+}
+
+func runGitCmd(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmdArgs := append([]string{"-C", dir}, args...)
+	cmd := exec.Command("git", cmdArgs...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git command %v in %s failed: %v, output: %s", args, dir, err, string(out))
+	}
+	return string(out)
 }
 
 func getFreePort(t *testing.T) int {

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -10,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
@@ -90,6 +93,7 @@ Usage:
 
 Available Commands:
   compare     Compare two directories and generate an HTML diff report
+  gitdiff     Compare directory with a git reference (HEAD, commit, tag)
   history     List past comparison runs
   serve       Start an HTTP server to view comparison reports
   clear       Delete all past comparison reports and reset history
@@ -130,6 +134,8 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer, st
 		switch cmdArgs[0] {
 		case "compare":
 			return runCompare([]string{"--help"}, stdout, stderr)
+		case "gitdiff":
+			return runGitDiff(ctx, []string{"--help"}, stdout, stderr)
 		case "history":
 			return runHistory([]string{"--help"}, stdout, stderr)
 		case "serve":
@@ -145,6 +151,8 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer, st
 		}
 	case "compare":
 		return runCompare(cmdArgs, stdout, stderr)
+	case "gitdiff":
+		return runGitDiff(ctx, cmdArgs, stdout, stderr)
 	case "history":
 		return runHistory(cmdArgs, stdout, stderr)
 	case "serve":
@@ -253,7 +261,259 @@ func runCompare(args []string, stdout, stderr io.Writer) error {
 		title = fmt.Sprintf("%s vs %s", filepath.Base(leftAbs), filepath.Base(rightAbs))
 	}
 
-	fmt.Fprintf(stdout, "Comparing:\n  Left:  %s\n  Right: %s\n", leftAbs, rightAbs)
+	return executeComparison(leftAbs, rightAbs, leftAbs, rightAbs, title, outputDir, full, stdout)
+}
+
+func runGitDiff(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("kdiff gitdiff", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var hash string
+	fs.StringVar(&hash, "hash", "", "Git commit hash to compare against (defaults to HEAD)")
+
+	var tag string
+	fs.StringVar(&tag, "tag", "", "Git tag to compare against (defaults to HEAD)")
+
+	var full bool
+	fs.BoolVar(&full, "full", false, "Exhaustive scan: include node_modules, vendor, and build folders")
+	fs.BoolVar(&full, "f", false, "Alias for --full")
+
+	var outputDir string
+	fs.StringVar(&outputDir, "output", "", "Output directory for reports (default \"~/.kdiff\")")
+	fs.StringVar(&outputDir, "o", "", "Alias for --output")
+
+	var title string
+	fs.StringVar(&title, "title", "", "Custom title for this comparison run")
+	fs.StringVar(&title, "t", "", "Alias for --title")
+
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "Usage: kdiff gitdiff [flags] [dir]\n\n")
+		fmt.Fprintf(stderr, "Compare current directory or repository with a git reference (HEAD, commit hash, or tag) and generate an HTML diff report.\n\n")
+		fmt.Fprintf(stderr, "Flags:\n")
+		fmt.Fprintf(stderr, "      --hash string     Git commit hash to compare against\n")
+		fmt.Fprintf(stderr, "      --tag string      Git tag to compare against\n")
+		fmt.Fprintf(stderr, "  -f, --full            Exhaustive scan (do not exclude node_modules, vendor, .git, etc.)\n")
+		fmt.Fprintf(stderr, "  -o, --output string   Output directory for reports (default \"~/.kdiff\")\n")
+		fmt.Fprintf(stderr, "  -t, --title string    Custom title for this comparison run\n")
+		fmt.Fprintf(stderr, "  -h, --help            Show this help message\n")
+	}
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git is not installed or not in PATH: %w", err)
+	}
+
+	posArgs := fs.Args()
+	targetDir := "."
+	if len(posArgs) > 0 {
+		targetDir = posArgs[0]
+	}
+	if len(posArgs) > 1 {
+		fs.Usage()
+		return fmt.Errorf("too many arguments provided for gitdiff")
+	}
+
+	if hash != "" && tag != "" {
+		return fmt.Errorf("cannot specify both --hash and --tag")
+	}
+
+	targetAbs, err := filepath.Abs(targetDir)
+	if err != nil {
+		return fmt.Errorf("resolving target directory %s: %w", targetDir, err)
+	}
+
+	info, err := os.Stat(targetAbs)
+	if err != nil {
+		return fmt.Errorf("directory does not exist or cannot be accessed: %s", targetDir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", targetDir)
+	}
+
+	checkRepoCmd := exec.CommandContext(ctx, "git", "-C", targetAbs, "rev-parse", "--is-inside-work-tree")
+	out, err := checkRepoCmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		return fmt.Errorf("%s is not inside a git repository", targetAbs)
+	}
+
+	repoRootCmd := exec.CommandContext(ctx, "git", "-C", targetAbs, "rev-parse", "--show-toplevel")
+	rootOut, err := repoRootCmd.Output()
+	if err != nil {
+		return fmt.Errorf("getting git repository root: %w", err)
+	}
+	repoRoot := strings.TrimSpace(string(rootOut))
+
+	prefixCmd := exec.CommandContext(ctx, "git", "-C", targetAbs, "rev-parse", "--show-prefix")
+	prefixOut, err := prefixCmd.Output()
+	if err != nil {
+		return fmt.Errorf("getting git prefix: %w", err)
+	}
+	prefix := strings.TrimSpace(string(prefixOut))
+
+	var gitRef string
+	var refType string
+	if hash != "" {
+		gitRef = hash
+		refType = "commit"
+	} else if tag != "" {
+		gitRef = tag
+		refType = "tag"
+	} else {
+		gitRef = "HEAD"
+		refType = "head"
+	}
+
+	// Verify git ref exists
+	verifyCmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "rev-parse", "--verify", gitRef+"^{commit}")
+	if _, err := verifyCmd.CombinedOutput(); err != nil {
+		vCmd2 := exec.CommandContext(ctx, "git", "-C", repoRoot, "rev-parse", "--verify", gitRef)
+		if _, err2 := vCmd2.CombinedOutput(); err2 != nil {
+			switch refType {
+			case "commit":
+				return fmt.Errorf("commit hash not found: %s", hash)
+			case "tag":
+				return fmt.Errorf("tag not found: %s", tag)
+			default:
+				return fmt.Errorf("git repository has no commits (HEAD is unborn)")
+			}
+		}
+	}
+
+	// Get short commit SHA
+	shortShaCmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "rev-parse", "--short", gitRef)
+	var shortSha string
+	if shaOut, err := shortShaCmd.Output(); err == nil {
+		shortSha = strings.TrimSpace(string(shaOut))
+	} else {
+		shortSha = gitRef
+	}
+
+	// Export git revision to temporary directory
+	tempDir, err := os.MkdirTemp("", "kdiff-git-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := extractGitArchive(ctx, repoRoot, gitRef, tempDir); err != nil {
+		return fmt.Errorf("extracting git archive for %s: %w", gitRef, err)
+	}
+
+	leftPath := tempDir
+	if prefix != "" {
+		leftPath = filepath.Join(tempDir, filepath.FromSlash(prefix))
+		if err := os.MkdirAll(leftPath, 0755); err != nil {
+			return fmt.Errorf("preparing comparison directory: %w", err)
+		}
+	}
+
+	baseName := filepath.Base(targetAbs)
+	if title == "" {
+		switch refType {
+		case "commit":
+			title = fmt.Sprintf("Commit %s vs %s", shortSha, baseName)
+		case "tag":
+			title = fmt.Sprintf("Tag %s vs %s", tag, baseName)
+		default:
+			title = fmt.Sprintf("HEAD (%s) vs %s", shortSha, baseName)
+		}
+	}
+
+	var leftLabel string
+	switch refType {
+	case "commit":
+		leftLabel = fmt.Sprintf("git:commit %s", shortSha)
+	case "tag":
+		leftLabel = fmt.Sprintf("git:tag %s (%s)", tag, shortSha)
+	default:
+		leftLabel = fmt.Sprintf("git:HEAD (%s)", shortSha)
+	}
+
+	return executeComparison(leftPath, targetAbs, leftLabel, targetAbs, title, outputDir, full, stdout)
+}
+
+func extractGitArchive(ctx context.Context, repoRoot, gitRef, destDir string) error {
+	cmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "archive", "--format=tar", gitRef)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("creating pipe: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting git archive: %w", err)
+	}
+
+	tarReader := tar.NewReader(stdout)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			_ = cmd.Wait()
+			return fmt.Errorf("reading tar stream: %w", err)
+		}
+
+		cleanPath := filepath.Clean(header.Name)
+		if strings.HasPrefix(cleanPath, "..") || filepath.IsAbs(cleanPath) {
+			continue
+		}
+
+		targetPath := filepath.Join(destDir, cleanPath)
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+			mode := header.FileInfo().Mode()
+			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, mode)
+			if err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+			if _, err := io.Copy(f, tarReader); err != nil {
+				f.Close()
+				_ = cmd.Wait()
+				return err
+			}
+			f.Close()
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+			_ = os.Remove(targetPath)
+			_ = os.Symlink(header.Linkname, targetPath)
+		}
+	}
+
+	if err := cmd.Wait(); err != nil {
+		errOutput := strings.TrimSpace(stderrBuf.String())
+		if errOutput != "" {
+			return fmt.Errorf("git archive failed: %s", errOutput)
+		}
+		return fmt.Errorf("git archive failed: %w", err)
+	}
+	return nil
+}
+
+func executeComparison(leftScanDir, rightScanDir, leftDisplay, rightDisplay, title, outputDir string, full bool, stdout io.Writer) error {
+	fmt.Fprintf(stdout, "Comparing:\n  Left:  %s\n  Right: %s\n", leftDisplay, rightDisplay)
 	if full {
 		fmt.Fprintf(stdout, "Mode: Full comparison (all folders included)\n")
 	} else {
@@ -261,7 +521,7 @@ func runCompare(args []string, stdout, stderr io.Writer) error {
 	}
 
 	// 1. Scan
-	scannedItems, err := scanner.Scan(leftAbs, rightAbs, scanner.Options{Full: full})
+	scannedItems, err := scanner.Scan(leftScanDir, rightScanDir, scanner.Options{Full: full})
 	if err != nil {
 		return fmt.Errorf("scanning directories: %w", err)
 	}
@@ -301,8 +561,8 @@ func runCompare(args []string, stdout, stderr io.Writer) error {
 	compReport := differ.ComparisonReport{
 		Timestamp:      time.Now(),
 		Title:          title,
-		LeftPath:       leftAbs,
-		RightPath:      rightAbs,
+		LeftPath:       leftDisplay,
+		RightPath:      rightDisplay,
 		TotalFiles:     len(fileDiffs),
 		AddedCount:     addedCount,
 		DeletedCount:   deletedCount,

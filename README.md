@@ -46,6 +46,12 @@ kdiff <command> [arguments]
   - `-f, --full`: Exhaustive scan including `node_modules`, `vendor`, build folders, etc.
   - `-o, --output <dir>`: Custom output directory for reports (default `~/.kdiff`).
   - `-t, --title <title>`: Custom title for this comparison run.
+- `kdiff gitdiff [flags] [dir]`: Compare working directory with a git reference (`HEAD`, commit hash, or tag).
+  - `--hash <commit-hash>`: Compare against a specific git commit hash.
+  - `--tag <tag>`: Compare against a specific git tag.
+  - `-f, --full`: Exhaustive scan including `node_modules`, `vendor`, build folders, etc.
+  - `-o, --output <dir>`: Custom output directory for reports (default `~/.kdiff`).
+  - `-t, --title <title>`: Custom title for this comparison run.
 - `kdiff history [flags]`: List past comparison runs and catalog link.
   - `-o, --output <dir>`: Custom output directory (default `~/.kdiff`).
 - `kdiff serve [flags]`: Start an HTTP server to view past comparison reports and catalog.
@@ -66,6 +72,13 @@ kdiff compare ./project-v1 ./project-v2
 
 # Full comparison with custom title and output folder
 kdiff compare --full -t "Release 2.0 vs 2.1" -o ./diff-reports ./dirA ./dirB
+
+# Compare current working directory against Git HEAD
+kdiff gitdiff
+
+# Compare working directory against a Git tag or commit hash
+kdiff gitdiff --tag v1.0.0
+kdiff gitdiff --hash 8c1f34d -o ./diff-reports
 
 # View history
 kdiff history
